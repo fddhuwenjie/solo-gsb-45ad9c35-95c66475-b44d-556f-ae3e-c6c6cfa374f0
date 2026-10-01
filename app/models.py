@@ -133,6 +133,7 @@ AuditOperation = Literal[
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
+    "event_held", "event_hold_released",
 ]
 
 
@@ -600,3 +601,63 @@ class DisruptionReplanOut(BaseModel):
     min_transfer_seconds: int
     summary: ReplanSummary
     groups: list[ReplanGroupResult]
+
+
+# ---------------------------------------------------------------------------
+# Tap-event review holds (刷卡事件复核暂存与释放)
+# ---------------------------------------------------------------------------
+
+
+class EventHoldIn(BaseModel):
+    hold_id: str = Field(min_length=1, max_length=128)
+    passenger_id: str = Field(min_length=1, max_length=128)
+    event_ids: list[str] = Field(
+        min_length=1,
+        description="Tap events to freeze for review; every id must exist and belong to the passenger",
+    )
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class EventHoldReleaseIn(BaseModel):
+    expected_version: int = Field(
+        ge=1,
+        description="Optimistic version the release decision was based on (1 while the hold is held)",
+    )
+
+
+class HeldEventSnapshot(BaseModel):
+    """Immutable copy of a held event's full payload at hold time."""
+    event_id: str
+    passenger_id: str
+    station_id: str
+    tap_type: Literal["in", "out"]
+    occurred_at: str
+    seq: int
+    prior_status: Literal["paired", "pending"]  # the pairing state just before the hold
+    pending_reason: str | None = None
+
+
+class HoldReleaseResult(BaseModel):
+    """Append-only outcome of a release (re-settlement on the original seqs)."""
+    expected_version: int
+    released_at: str
+    adjustments: list[Adjustment]
+    affected_trip_count: int
+    net_delta_cents: int
+
+
+class EventHoldOut(BaseModel):
+    hold_id: str
+    status: Literal["created", "duplicate"]  # request replay marker
+    state: Literal["held", "released"]
+    version: int                    # 1 while held, 2 once released (optimistic)
+    passenger_id: str
+    event_ids: list[str]
+    reason: str
+    created_at: str
+    snapshots: list[HeldEventSnapshot]
+    # Trip deltas produced when the events were first frozen and withdrawn from
+    # settlement (trips voided by the hold show up as negative reversals).
+    freeze_adjustments: list[Adjustment]
+    release: HoldReleaseResult | None = None
+    released_at: str | None = None

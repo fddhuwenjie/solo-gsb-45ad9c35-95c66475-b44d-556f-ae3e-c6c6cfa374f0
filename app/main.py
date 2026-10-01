@@ -47,6 +47,14 @@ from .event_quality import (
     payload_hash as scan_payload_hash,
     scan_events,
 )
+from .holds import (
+    canonical_hold_payload,
+    canonical_release_payload,
+    find_blocking_reference,
+    hold_response,
+    payload_hash as hold_payload_hash,
+    snapshot_matches_event,
+)
 from .models import (
     Adjustment,
     AuditEntry,
@@ -63,6 +71,9 @@ from .models import (
     DisputeResolveIn,
     DisruptionReplanIn,
     DisruptionReplanOut,
+    EventHoldIn,
+    EventHoldOut,
+    EventHoldReleaseIn,
     EventQualityScanIn,
     EventQualityScanOut,
     EventResult,
@@ -131,7 +142,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -180,6 +191,26 @@ def submit_event(
         existing = db.conn.execute(
             "SELECT * FROM events WHERE event_id = ?", (body.event_id,)
         ).fetchone()
+
+        if existing is not None and existing["status"] == "held":
+            # A frozen review event must not change -- or even be replayed --
+            # while under review; neither a correction nor a same-payload
+            # resubmission is accepted until the hold is released.
+            held_by = db.conn.execute(
+                "SELECT s.hold_id AS hold_id FROM event_hold_snapshots s"
+                " WHERE s.event_id = ? AND NOT EXISTS ("
+                " SELECT 1 FROM event_hold_releases r WHERE r.hold_id = s.hold_id)"
+                " ORDER BY s.seq LIMIT 1",
+                (body.event_id,),
+            ).fetchone()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event_id '{body.event_id}' is frozen by review hold"
+                    f" '{held_by['hold_id']}'; corrections are rejected until the"
+                    " hold is released via POST /event-holds/{hold_id}/release"
+                ),
+            )
 
         if existing is not None:
             identical = (
@@ -341,6 +372,303 @@ def pending_events(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tap-event review holds (刷卡事件复核暂存与释放)
+# ---------------------------------------------------------------------------
+
+
+def _held_snapshot_payload(row) -> dict:
+    return {
+        "passenger_id": row["passenger_id"],
+        "station_id": row["station_id"],
+        "tap_type": row["tap_type"],
+        "occurred_at": row["occurred_at"],
+        "seq": row["seq"],
+        "pending_reason": row["pending_reason"],
+    }
+
+
+@app.post("/event-holds", response_model=EventHoldOut, status_code=200)
+def create_event_hold(
+    body: EventHoldIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    """Freeze a batch of one passenger's events for review.
+
+    In one transaction: verify every event exists and belongs to the
+    passenger, reject the whole batch (409, no state change) if any event is
+    already booked by a reconciliation batch, a clearing batch or a resolved
+    dispute or is frozen by another open hold, copy each event's full payload
+    into an immutable snapshot, mark the events ``held`` and re-settle the
+    passenger without them (pairing, billing and pending queries stop using
+    the events for the duration of the hold).
+    """
+    event_ids = sorted(set(body.event_ids))
+    if len(event_ids) != len(body.event_ids):
+        raise HTTPException(status_code=422, detail="duplicate event_id in event_ids")
+
+    canonical_payload = canonical_hold_payload(body)
+    p_hash = hold_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (body.hold_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"hold_id '{body.hold_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen snapshots are never refrozen and
+            # the hold state is never changed.
+            return hold_response(db.conn, existing, "duplicate")
+
+        rows = db.conn.execute(
+            "SELECT * FROM events WHERE event_id IN ({})".format(
+                ",".join("?" for _ in event_ids)
+            ),
+            event_ids,
+        ).fetchall()
+        by_id = {r["event_id"]: r for r in rows}
+        missing = sorted(set(event_ids) - set(by_id))
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"event_id(s) not found: {missing}",
+            )
+        foreign = sorted(
+            eid for eid in event_ids if by_id[eid]["passenger_id"] != body.passenger_id
+        )
+        if foreign:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"event_id(s) {foreign} do not belong to passenger"
+                    f" '{body.passenger_id}'"
+                ),
+            )
+
+        held_elsewhere = db.conn.execute(
+            "SELECT s.event_id AS event_id, s.hold_id AS hold_id"
+            " FROM event_hold_snapshots s WHERE s.event_id IN ({})"
+            " AND NOT EXISTS (SELECT 1 FROM event_hold_releases r"
+            " WHERE r.hold_id = s.hold_id)".format(
+                ",".join("?" for _ in event_ids)
+            ),
+            event_ids,
+        ).fetchall()
+        if held_elsewhere:
+            detail = ", ".join(
+                f"{r['event_id']} (hold '{r['hold_id']}')" for r in held_elsewhere
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"event_id(s) already frozen by an open hold: {detail}",
+            )
+
+        # Whole-batch rejection: booked artefacts cannot have their events
+        # withdrawn from settlement without changing frozen money.
+        blocker = find_blocking_reference(db.conn, event_ids)
+        if blocker is not None:
+            _kind, event_id, detail = blocker
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot hold event_id '{event_id}': {detail};"
+                    " the whole batch is rejected and no state was changed"
+                ),
+            )
+
+        created_at = iso_str(datetime.now(timezone.utc))
+        # Withdraw the events from pairing/billing/pending and re-settle the
+        # passenger so the affected trips disappear (and caps/transfer chains
+        # are recomputed) for the duration of the hold. The freeze deltas are
+        # computed before any hold row is written, so the append-only
+        # event_holds row can carry them verbatim from its initial INSERT.
+        db.conn.executemany(
+            "UPDATE events SET status = 'held', pending_reason = NULL"
+            " WHERE event_id = ?",
+            [(eid,) for eid in event_ids],
+        )
+        freeze_adjustments = settle_passenger(db.conn, cfg, body.passenger_id)
+
+        # Freeze the full payloads; the snapshots are immutable and stay even
+        # after the release is appended. by_id rows were read before the
+        # 'held' UPDATE above, so the snapshot captures the pre-hold state.
+        snapshot_rows = [
+            {
+                "event_id": eid,
+                "prior_status": by_id[eid]["status"],
+                "payload": canonical_json(_held_snapshot_payload(by_id[eid])),
+            }
+            for eid in event_ids
+        ]
+        db.conn.execute(
+            "INSERT INTO event_holds (hold_id, payload_hash, passenger_id,"
+            " event_ids, reason, freeze_adjustments, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                body.hold_id,
+                p_hash,
+                body.passenger_id,
+                canonical_json(event_ids),
+                body.reason,
+                canonical_json(freeze_adjustments),
+                created_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO event_hold_snapshots (hold_id, seq, event_id,"
+            " prior_status, payload) VALUES (?,?,?,?,?)",
+            [
+                (body.hold_id, seq, s["event_id"], s["prior_status"], s["payload"])
+                for seq, s in enumerate(snapshot_rows)
+            ],
+        )
+
+        row = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (body.hold_id,)
+        ).fetchone()
+        response = hold_response(db.conn, row, "created")
+        append_audit(
+            db.conn,
+            "event_held",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.post("/event-holds/{hold_id}/release", response_model=EventHoldOut, status_code=200)
+def release_event_hold(
+    hold_id: str,
+    body: EventHoldReleaseIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    """Release a held batch after review: re-settle on the original seqs and
+    event times and return the per-trip increase/decrease amounts.
+
+    A stale optimistic version, or a frozen snapshot that no longer matches
+    the live event payload, rejects the release (409) with every event left
+    ``held``. The release result is appended; the hold row and its snapshots
+    are never modified.
+    """
+    canonical_payload = canonical_release_payload(body, hold_id)
+    p_hash = hold_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        hold = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if hold is None:
+            raise HTTPException(
+                status_code=404, detail=f"event hold '{hold_id}' not found"
+            )
+        release_row = db.conn.execute(
+            "SELECT * FROM event_hold_releases WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if release_row is not None:
+            if release_row["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"hold '{hold_id}' is already released (version 2); the"
+                        " release result is immutable and cannot be re-released"
+                    ),
+                )
+            # Idempotent replay of the identical release.
+            return hold_response(db.conn, hold, "duplicate")
+
+        if body.expected_version != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"version conflict: hold '{hold_id}' is at version 1 (held);"
+                    f" expected_version {body.expected_version} is stale"
+                ),
+            )
+
+        snap_rows = db.conn.execute(
+            "SELECT * FROM event_hold_snapshots WHERE hold_id = ? ORDER BY seq",
+            (hold_id,),
+        ).fetchall()
+        for snap in snap_rows:
+            event_row = db.conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (snap["event_id"],)
+            ).fetchone()
+            if not snapshot_matches_event(snap, event_row):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"snapshot mismatch for event_id '{snap['event_id']}':"
+                        " the live event payload no longer matches the frozen"
+                        " snapshot; the release is rejected and every event"
+                        " stays held"
+                    ),
+                )
+
+        # Return the events to the pairing engine as ordinary rows, then
+        # re-settle on their original seq / occurred_at. Their eventual
+        # paired/pending state is assigned by settle_passenger from the
+        # pairing result; other open holds of the same passenger stay 'held'.
+        db.conn.executemany(
+            "UPDATE events SET status = 'pending' WHERE event_id = ?"
+            " AND status = 'held'",
+            [(snap["event_id"],) for snap in snap_rows],
+        )
+        adjustments = settle_passenger(db.conn, cfg, hold["passenger_id"])
+        affected = {a["trip_id"] for a in adjustments}
+        result = {
+            "adjustments": adjustments,
+            "affected_trip_count": len(affected),
+            "net_delta_cents": sum(a["delta_cents"] for a in adjustments),
+        }
+        released_at = iso_str(datetime.now(timezone.utc))
+        db.conn.execute(
+            "INSERT INTO event_hold_releases (hold_id, payload_hash,"
+            " expected_version, result, created_at) VALUES (?,?,?,?,?)",
+            (hold_id, p_hash, body.expected_version, canonical_json(result), released_at),
+        )
+        row = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        response = hold_response(db.conn, row, "created")
+        append_audit(
+            db.conn,
+            "event_hold_released",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.get("/event-holds/{hold_id}", response_model=EventHoldOut)
+def get_event_hold(
+    hold_id: str,
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    with db.lock():
+        hold = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if hold is None:
+            raise HTTPException(
+                status_code=404, detail=f"event hold '{hold_id}' not found"
+            )
+        # The replay marker only appears on POST responses; a stored hold is
+        # always reported as "created", while the append-only release result
+        # (if any) shows the frozen re-settlement.
+        return hold_response(db.conn, hold, "created")
 
 
 def _recon_response(meta: dict, items: list[dict], status: str, currency: str) -> ReconBatchOut:
@@ -1850,7 +2178,8 @@ def list_audit(
         default=None,
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
-                "|dispute_opened|dispute_resolved|clearing_closed)$",
+                "|dispute_opened|dispute_resolved|clearing_closed"
+                "|event_held|event_hold_released)$",
         description="Filter by operation type",
     ),
     after: int = Query(default=0, ge=0, description="Return records with seq > after"),

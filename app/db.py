@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS events (
     tap_type       TEXT NOT NULL CHECK (tap_type IN ('in', 'out')),
     occurred_at    TEXT NOT NULL,          -- ISO-8601, normalised to UTC
     seq            INTEGER NOT NULL,       -- arrival order, tie-breaks equal timestamps
-    status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('paired', 'pending')),
+    status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('paired', 'pending', 'held')),
     pending_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_passenger ON events (passenger_id, occurred_at, seq);
@@ -414,6 +414,84 @@ BEGIN
     SELECT RAISE(ABORT, 'disruption_replans is append-only: DELETE is not allowed');
 END;
 
+-- Tap-event review holds. A hold withdraws a batch of one passenger's events
+-- from pairing/billing/pending for manual review: each event's full payload is
+-- copied verbatim into a snapshot row and the events table row is marked
+-- 'held'. Like disputes, the hold row is written once and never updated -- the
+-- held/released state and optimistic version are derived from whether a row
+-- exists in the append-only event_hold_releases table (version 1 = held,
+-- version 2 = released). Release re-settles on the original seqs/timestamps;
+-- its result is appended separately and the frozen hold/snapshot rows stay
+-- immutable for all time.
+CREATE TABLE IF NOT EXISTS event_holds (
+    hold_id             TEXT PRIMARY KEY,
+    payload_hash        TEXT NOT NULL,     -- sha256 of the canonical request
+    passenger_id        TEXT NOT NULL,
+    event_ids           TEXT NOT NULL,     -- canonical JSON: sorted event id list
+    reason              TEXT NOT NULL,
+    freeze_adjustments  TEXT NOT NULL,     -- JSON: per-trip deltas produced by freezing
+    created_at          TEXT NOT NULL
+);
+
+-- One immutable full-payload snapshot per held event. prior_status records
+-- the pairing state ('paired'/'pending') the event returned to on release.
+CREATE TABLE IF NOT EXISTS event_hold_snapshots (
+    hold_id        TEXT NOT NULL REFERENCES event_holds(hold_id),
+    seq            INTEGER NOT NULL,       -- 0-based, sorted by (event seq, event id)
+    event_id       TEXT NOT NULL,
+    prior_status   TEXT NOT NULL CHECK (prior_status IN ('paired', 'pending')),
+    payload        TEXT NOT NULL,          -- canonical JSON of the frozen full event payload
+    PRIMARY KEY (hold_id, seq),
+    UNIQUE (hold_id, event_id)
+);
+
+-- Exactly one append-only release result per hold. The release is rejected
+-- (and no row is written) on a stale expected version or a snapshot mismatch,
+-- so a stored release always reflects a completed re-settlement.
+CREATE TABLE IF NOT EXISTS event_hold_releases (
+    hold_id           TEXT PRIMARY KEY REFERENCES event_holds(hold_id),
+    payload_hash      TEXT NOT NULL,       -- sha256 of the canonical release request
+    expected_version  INTEGER NOT NULL,    -- optimistic version the decision was based on
+    result            TEXT NOT NULL,       -- JSON: adjustments / affected count / net delta
+    created_at        TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_event_holds_no_update
+BEFORE UPDATE ON event_holds
+BEGIN
+    SELECT RAISE(ABORT, 'event_holds is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_holds_no_delete
+BEFORE DELETE ON event_holds
+BEGIN
+    SELECT RAISE(ABORT, 'event_holds is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_snapshots_no_update
+BEFORE UPDATE ON event_hold_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_snapshots is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_snapshots_no_delete
+BEFORE DELETE ON event_hold_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_snapshots is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_releases_no_update
+BEFORE UPDATE ON event_hold_releases
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_releases is an append-only ledger: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_releases_no_delete
+BEFORE DELETE ON event_hold_releases
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_releases is an append-only ledger: DELETE is not allowed');
+END;
+
 -- Append-only, hash-chained business audit log. One global sequence spans all
 -- operation types; record_n hashes seq | operation | timestamp | canonical
 -- request/result summaries | record_{n-1}'s hash. Rows are only ever inserted
@@ -425,7 +503,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed')),
+                          'clearing_closed',
+                          'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
     result_summary   TEXT NOT NULL,         -- canonical JSON of the normalised result
@@ -447,13 +526,14 @@ END;
 """
 
 # Rebuild statement used when upgrading a database created before a newer
-# operation type (network validation, then fare disputes): SQLite cannot ALTER
-# a CHECK constraint, so the audit table is rebuilt with the rows preserved
-# (its hash chain lives entirely in columns).
+# operation type (network validation, then fare disputes, then review holds):
+# SQLite cannot ALTER a CHECK constraint, so the audit table is rebuilt with
+# the rows preserved (its hash chain lives entirely in columns).
 _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
+    "event_held", "event_hold_released",
 )
 
 _AUDIT_UPGRADE = """
@@ -467,7 +547,8 @@ CREATE TABLE audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed')),
+                          'clearing_closed',
+                          'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
     result_summary   TEXT NOT NULL,
@@ -491,6 +572,31 @@ BEGIN
 END;
 """
 
+# Rebuild statement used when upgrading a database whose events status CHECK
+# predates the review-hold state ('held'). The events table has no foreign-key
+# dependents (trips reference event ids only by value), so a table rebuild
+# preserving every row and the passenger index is sufficient.
+_EVENTS_HELD_UPGRADE = """
+DROP INDEX IF EXISTS idx_events_passenger;
+ALTER TABLE events RENAME TO events_legacy;
+CREATE TABLE events (
+    event_id       TEXT PRIMARY KEY,
+    passenger_id   TEXT NOT NULL,
+    station_id     TEXT NOT NULL,
+    tap_type       TEXT NOT NULL CHECK (tap_type IN ('in', 'out')),
+    occurred_at    TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('paired', 'pending', 'held')),
+    pending_reason TEXT
+);
+INSERT INTO events (event_id, passenger_id, station_id, tap_type, occurred_at,
+                    seq, status, pending_reason)
+SELECT event_id, passenger_id, station_id, tap_type, occurred_at,
+       seq, status, pending_reason FROM events_legacy;
+DROP TABLE events_legacy;
+CREATE INDEX idx_events_passenger ON events (passenger_id, occurred_at, seq);
+"""
+
 
 class Database:
     def __init__(self, path: str):
@@ -505,12 +611,19 @@ class Database:
         with self._conn:
             self._conn.executescript(SCHEMA)
             # Upgrade an older database whose audit_log CHECK predates one of
-            # the current operation types (network validation, disputes).
+            # the current operation types (network validation, disputes, holds).
             sql = self._conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"
             ).fetchone()[0]
             if any(op not in sql for op in _AUDIT_OPERATIONS):
                 self._conn.executescript(_AUDIT_UPGRADE)
+            # Upgrade an older database whose events status CHECK predates the
+            # review-hold 'held' state.
+            sql = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()[0]
+            if "'held'" not in sql:
+                self._conn.executescript(_EVENTS_HELD_UPGRADE)
 
     def lock(self) -> threading.RLock:
         return self._lock

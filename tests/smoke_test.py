@@ -29,6 +29,14 @@ merge at a transfer station, (ready_at, group_id) processing order, indivisible
 parties, per-section seat deduction, stranded reasons, timetable uniqueness and
 monotonicity validation, idempotency/409 conflict, GET query, isolated
 append-only tables with no business or audit side effects),
+the tap-event review hold endpoints (one-transaction ownership checks and full
+payload snapshots, events marked held and withdrawn from pairing/billing/
+pending, whole-batch 409 when referenced by reconciliation/clearing/resolved
+dispute or frozen by another open hold, rejection of every resubmission while
+held, optimistic release re-settling on the original seqs/times with per-trip
+deltas, version-conflict and snapshot-mismatch rejection that keeps events
+held, idempotent replay/409 conflict, immutable holds/snapshots with the
+release appended separately, GET frozen-state query),
 the append-only hash-chained business audit log (idempotency, verification,
 tamper detection, append-only triggers, atomic rollback),
 and the online GET /admin/backup endpoint (SQLite backup API, live writes keep
@@ -2002,6 +2010,295 @@ def run(client):
           client.get("/audit", params={"limit": 1000}).json()["count"]
           == audit_before_replans)
 
+    # --- Tap-event review holds -----------------------------------------------
+    # Passenger HF, 2026-12-15 (a day no other section uses):
+    #   hf1:hf2 S01->S04 08:00->08:30 = 500
+    #   hf3:hf4 S05->S06 09:00->09:20 = 300 - 100 transfer = 200
+    def hpost(eid, st, tap, ts, passenger="HF"):
+        rr = client.post("/events", json={
+            "event_id": eid, "passenger_id": passenger,
+            "station_id": st, "tap_type": tap, "occurred_at": ts})
+        assert rr.status_code == 200, rr.text
+
+    hpost("hf1", "S01", "in", "2026-12-15T08:00:00Z")
+    hpost("hf2", "S04", "out", "2026-12-15T08:30:00Z")
+    hpost("hf3", "S05", "in", "2026-12-15T09:00:00Z")
+    hpost("hf4", "S06", "out", "2026-12-15T09:20:00Z")
+    check("HF fixtures priced 500 + 200",
+          {t["trip_id"]: t["amount_cents"]
+           for t in client.get("/passengers/HF/bill").json()["trips"]}
+          == {"hf1:hf2": 500, "hf3:hf4": 200})
+
+    hold_body = {
+        "hold_id": "hold-2026-12-15-a",
+        "passenger_id": "HF",
+        "event_ids": ["hf2", "hf1"],          # unordered on purpose
+        "reason": "manual review of the morning trip",
+    }
+    r = client.post("/event-holds", json=hold_body)
+    check("hold created", r.status_code == 200 and r.json()["status"] == "created")
+    hold = r.json()
+    check("hold is version 1 / held",
+          hold["state"] == "held" and hold["version"] == 1
+          and hold["release"] is None and hold["released_at"] is None)
+    check("event ids canonicalised to sorted order",
+          hold["event_ids"] == ["hf1", "hf2"])
+    snaps = {s["event_id"]: s for s in hold["snapshots"]}
+    check("snapshots freeze the full payload in seq order",
+          [s["event_id"] for s in hold["snapshots"]] == ["hf1", "hf2"]
+          and snaps["hf1"]["station_id"] == "S01" and snaps["hf1"]["tap_type"] == "in"
+          and snaps["hf1"]["occurred_at"] == "2026-12-15T08:00:00Z" and snaps["hf1"]["seq"] >= 1
+          and snaps["hf2"]["station_id"] == "S04" and snaps["hf2"]["tap_type"] == "out"
+          and snaps["hf1"]["prior_status"] == "paired"
+          and snaps["hf2"]["prior_status"] == "paired")
+    freeze = {a["trip_id"]: a for a in hold["freeze_adjustments"]}
+    check("freezing voids the held trip and re-prices the transfer tail",
+          freeze["hf1:hf2"]["new_amount_cents"] == 0
+          and freeze["hf1:hf2"]["delta_cents"] == -500
+          and freeze["hf3:hf4"]["old_amount_cents"] == 200
+          and freeze["hf3:hf4"]["new_amount_cents"] == 300
+          and freeze["hf3:hf4"]["delta_cents"] == 100)
+
+    # Held events are withdrawn from billing, pairing and pending queries.
+    held_bill = {t["trip_id"]: t["amount_cents"]
+                 for t in client.get("/passengers/HF/bill").json()["trips"]}
+    check("bill excludes the held trip while held",
+          held_bill == {"hf3:hf4": 300})
+    check("pending list hides held events",
+          all(p["event_id"] not in ("hf1", "hf2")
+              for p in client.get("/pending").json()))
+
+    # No resubmission of a held event is accepted -- not even an identical one.
+    r = client.post("/events", json={
+        "event_id": "hf1", "passenger_id": "HF", "station_id": "S02",
+        "tap_type": "in", "occurred_at": "2026-12-15T08:00:00Z"})
+    check("correction of a held event -> 409", r.status_code == 409)
+    r = client.post("/events", json={
+        "event_id": "hf1", "passenger_id": "HF", "station_id": "S01",
+        "tap_type": "in", "occurred_at": "2026-12-15T08:00:00Z"})
+    check("identical resubmission of a held event is also 409",
+          r.status_code == 409 and "hold-2026-12-15-a" in r.text)
+    check("rejected correction changes nothing",
+          {t["trip_id"]: t["amount_cents"]
+           for t in client.get("/passengers/HF/bill").json()["trips"]}
+          == {"hf3:hf4": 300})
+
+    # Idempotent hold replay: same payload (even reordered) -> stored result;
+    # different payload -> 409.
+    r = client.post("/event-holds", json=hold_body)
+    check("identical hold replays as duplicate",
+          r.status_code == 200 and r.json()["status"] == "duplicate"
+          and r.json()["created_at"] == hold["created_at"]
+          and r.json()["freeze_adjustments"] == hold["freeze_adjustments"])
+    r = client.post("/event-holds", json=dict(hold_body, reason="changed reason"))
+    check("same hold_id different payload -> 409", r.status_code == 409)
+    r = client.post("/event-holds", json=dict(hold_body, event_ids=["hf1"]))
+    check("same hold_id different event set -> 409", r.status_code == 409)
+
+    # GET reports the frozen state.
+    r = client.get("/event-holds/hold-2026-12-15-a")
+    check("GET hold returns created marker and frozen snapshots",
+          r.status_code == 200 and r.json()["status"] == "created"
+          and r.json()["state"] == "held"
+          and len(r.json()["snapshots"]) == 2)
+    check("unknown hold -> 404",
+          client.get("/event-holds/does-not-exist").status_code == 404)
+
+    # The same event cannot enter another open hold; the whole batch rejects.
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-overlap", "passenger_id": "HF",
+        "event_ids": ["hf1", "hf3"], "reason": "x"})
+    check("overlapping open hold on one event rejects the whole batch 409",
+          r.status_code == 409 and "hf1" in r.text)
+    check("rejected overlap leaves the other event untouched",
+          all(p["event_id"] != "hf3" for p in client.get("/pending").json())
+          and "hf3:hf4" in held_bill)
+
+    # Structural validation.
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-bad-dup", "passenger_id": "HF",
+        "event_ids": ["hf3", "hf3"], "reason": "x"})
+    check("duplicate event_id in request -> 422", r.status_code == 422)
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-bad-missing", "passenger_id": "HF",
+        "event_ids": ["nope"], "reason": "x"})
+    check("unknown event -> 404", r.status_code == 404)
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-bad-passenger", "passenger_id": "OTHER",
+        "event_ids": ["hf3"], "reason": "x"})
+    check("event of another passenger -> 422", r.status_code == 422)
+
+    # Stale version and snapshot-mismatch rejections keep the events held.
+    r = client.post("/event-holds/hold-2026-12-15-a/release",
+                    json={"expected_version": 2})
+    check("release with stale version while held -> 409", r.status_code == 409)
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        raw.execute("UPDATE events SET station_id = 'S07' WHERE event_id = 'hf1'")
+    r = client.post("/event-holds/hold-2026-12-15-a/release",
+                    json={"expected_version": 1})
+    check("release with a tampered snapshot -> 409 and stays held",
+          r.status_code == 409 and "snapshot mismatch" in r.text
+          and client.get("/event-holds/hold-2026-12-15-a").json()["state"] == "held")
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        statuses = dict(raw.execute(
+            "SELECT event_id, status FROM events WHERE event_id IN ('hf1','hf2')"))
+    check("failed release leaves every event held",
+          statuses == {"hf1": "held", "hf2": "held"})
+    # Restore the tampered row so the optimistic release can proceed.
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        raw.execute("UPDATE events SET station_id = 'S01' WHERE event_id = 'hf1'")
+
+    # Happy-path release: re-settle on the original seq/times.
+    r = client.post("/event-holds/hold-2026-12-15-a/release",
+                    json={"expected_version": 1})
+    check("release succeeds at version 1", r.status_code == 200)
+    rel = r.json()
+    check("release moves the hold to version 2 / released",
+          rel["state"] == "released" and rel["version"] == 2
+          and rel["released_at"] is not None and rel["release"] is not None)
+    radj = {a["trip_id"]: a for a in rel["release"]["adjustments"]}
+    check("release re-settles on the original seqs and times",
+          radj["hf1:hf2"]["old_amount_cents"] == 0
+          and radj["hf1:hf2"]["new_amount_cents"] == 500
+          and radj["hf1:hf2"]["delta_cents"] == 500
+          and radj["hf3:hf4"]["old_amount_cents"] == 300
+          and radj["hf3:hf4"]["new_amount_cents"] == 200
+          and radj["hf3:hf4"]["delta_cents"] == -100)
+    check("release result reports affected trips and net delta",
+          rel["release"]["affected_trip_count"] == 2
+          and rel["release"]["net_delta_cents"] == 400
+          and rel["release"]["released_at"] == rel["released_at"])
+    check("bill is back to 500 + 200 after release",
+          {t["trip_id"]: t["amount_cents"]
+           for t in client.get("/passengers/HF/bill").json()["trips"]}
+          == {"hf1:hf2": 500, "hf3:hf4": 200})
+
+    # Idempotent release replay; different payload on a released hold -> 409.
+    r = client.post("/event-holds/hold-2026-12-15-a/release",
+                    json={"expected_version": 1})
+    check("identical release replays as duplicate with the same result",
+          r.status_code == 200 and r.json()["status"] == "duplicate"
+          and r.json()["release"]["adjustments"] == rel["release"]["adjustments"])
+    r = client.post("/event-holds/hold-2026-12-15-a/release",
+                    json={"expected_version": 2})
+    check("re-release with a different payload -> 409", r.status_code == 409)
+    check("releasing an unknown hold -> 404",
+          client.post("/event-holds/no-such/release",
+                      json={"expected_version": 1}).status_code == 404)
+
+    # The frozen records survive the release untouched; the release is a
+    # separate append-only row.
+    g = client.get("/event-holds/hold-2026-12-15-a").json()
+    check("GET after release still returns the original frozen snapshots",
+          {s["event_id"]: s["station_id"] for s in g["snapshots"]}
+          == {"hf1": "S01", "hf2": "S04"}
+          and {a["trip_id"] for a in g["freeze_adjustments"]}
+          == {"hf1:hf2", "hf3:hf4"})
+
+    # A released event can be held again; a held *pending* event drops out of
+    # the pending list and returns to it on release.
+    check("a previously held event can be held again after release",
+          client.post("/event-holds", json={
+              "hold_id": "hold-again", "passenger_id": "HF",
+              "event_ids": ["hf1"], "reason": "second review"}).status_code == 200)
+    check("re-hold releases cleanly",
+          client.post("/event-holds/hold-again/release",
+                      json={"expected_version": 1}).status_code == 200)
+
+    # Fresh orphan tap-out (after the first hold's release) for the
+    # pending-event hold checks.
+    hpost("hf5", "S04", "out", "2026-12-15T10:00:00Z")
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-pending", "passenger_id": "HF",
+        "event_ids": ["hf5"], "reason": "review orphan tap-out"})
+    check("pending event hold freezes the prior pending reason",
+          r.status_code == 200
+          and r.json()["snapshots"][0]["prior_status"] == "pending"
+          and r.json()["freeze_adjustments"] == [])
+    check("orphan held event hidden from pending",
+          all(p["event_id"] != "hf5"
+              for p in client.get("/pending", params={"passenger_id": "HF"}).json()))
+    r = client.post("/event-holds/hold-pending/release",
+                    json={"expected_version": 1})
+    check("orphan returns to pending on release (no adjustments)",
+          r.status_code == 200 and r.json()["release"]["adjustments"] == []
+          and [p["event_id"] for p in client.get("/pending", params={"passenger_id": "HF"}).json()]
+          == ["hf5"])
+
+    # Booked artefacts reject holds with 409 and leave state unchanged.
+    check("event frozen by a reconciliation batch cannot be held",
+          client.post("/event-holds", json={
+              "hold_id": "hold-blocked-recon", "passenger_id": "RA",
+              "event_ids": ["ra1"], "reason": "x"}).status_code == 409)
+    check("event booked by a clearing batch cannot be held",
+          client.post("/event-holds", json={
+              "hold_id": "hold-blocked-clearing", "passenger_id": "OP",
+              "event_ids": ["op1"], "reason": "x"}).status_code == 409)
+    check("event under a resolved dispute cannot be held",
+          client.post("/event-holds", json={
+              "hold_id": "hold-blocked-dispute", "passenger_id": "DP",
+              "event_ids": ["dp1"], "reason": "x"}).status_code == 409)
+    # d5 is an OPEN dispute on dp1:dp2 (d1 on the same trip is resolved, so
+    # its events are actually blocked -- but a later correction re-paired the
+    # trip to dp1:dp2 again; verify the resolved-dispute block fires first).
+    check("resolved dispute still blocks even with another open dispute",
+          client.post("/event-holds", json={
+              "hold_id": "hold-blocked-dispute2", "passenger_id": "DP",
+              "event_ids": ["dp1"], "reason": "x"}).status_code == 409)
+    # Open-dispute-only case: create a fresh trip, open a dispute, hold it.
+    def dpost(eid, st, tap, ts):
+        rr = client.post("/events", json={
+            "event_id": eid, "passenger_id": "DPO", "station_id": st,
+            "tap_type": tap, "occurred_at": ts})
+        assert rr.status_code == 200, rr.text
+    dpost("dpo1", "S01", "in", "2026-12-16T08:00:00Z")
+    dpost("dpo2", "S04", "out", "2026-12-16T08:30:00Z")
+    r = client.post("/disputes", json={
+        "dispute_id": "dp-open-only", "passenger_id": "DPO",
+        "trip_id": "dpo1:dpo2", "claimed_amount_cents": 100, "reason": "open"})
+    check("fresh open dispute created", r.status_code == 200 and r.json()["state"] == "open")
+    r = client.post("/event-holds", json={
+        "hold_id": "hold-open-dispute", "passenger_id": "DPO",
+        "event_ids": ["dpo1", "dpo2"], "reason": "review despite open dispute"})
+    check("an event under an open (unresolved) dispute CAN be held",
+          r.status_code == 200 and r.json()["state"] == "held")
+    check("held trip reads as current amount 0 from the open dispute",
+          client.get("/disputes/dp-open-only").json()["recomputed"]["current_amount_cents"] == 0)
+    r = client.post("/event-holds/hold-open-dispute/release",
+                    json={"expected_version": 1})
+    check("open-dispute hold releases cleanly", r.status_code == 200)
+    check("open dispute sees the trip back after release (zone 1->2 = 500)",
+          client.get("/disputes/dp-open-only").json()["recomputed"]["current_amount_cents"] == 500)
+    check("rejected blocker holds leave no row",
+          client.get("/event-holds/hold-blocked-recon").status_code == 404
+          and client.get("/event-holds/hold-blocked-clearing").status_code == 404
+          and client.get("/event-holds/hold-blocked-dispute").status_code == 404
+          and client.get("/event-holds/hold-blocked-dispute2").status_code == 404)
+
+    # Hold tables are append-only at the storage layer.
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        blocked_holds = []
+        for stmt in (
+            "UPDATE event_holds SET reason = 'x' WHERE hold_id = 'hold-2026-12-15-a'",
+            "DELETE FROM event_holds WHERE hold_id = 'hold-2026-12-15-a'",
+            "UPDATE event_hold_snapshots SET prior_status = 'paired'"
+            " WHERE hold_id = 'hold-2026-12-15-a'",
+            "DELETE FROM event_hold_snapshots WHERE hold_id = 'hold-2026-12-15-a'",
+            "UPDATE event_hold_releases SET expected_version = 9"
+            " WHERE hold_id = 'hold-2026-12-15-a'",
+            "DELETE FROM event_hold_releases WHERE hold_id = 'hold-2026-12-15-a'",
+        ):
+            try:
+                raw.execute(stmt)
+            except sqlite3.Error:
+                blocked_holds.append(stmt)
+        check("hold/snapshot/release tables cannot be updated or deleted",
+              len(blocked_holds) == 6)
+        check("exactly one release row per hold",
+              raw.execute(
+                  "SELECT COUNT(*) FROM event_hold_releases"
+                  " WHERE hold_id = 'hold-2026-12-15-a'").fetchone()[0] == 1)
+
     # --- Business audit chain ----------------------------------------------------
     # Fetch the whole chain in one page: the default page size is 100 and this
     # run appends well over 100 business records.
@@ -2025,6 +2322,9 @@ def run(client):
         n_resolved = raw.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
         n_clearing = raw.execute(
             "SELECT COUNT(*) FROM clearing_batches").fetchone()[0]
+        n_holds = raw.execute("SELECT COUNT(*) FROM event_holds").fetchone()[0]
+        n_hold_releases = raw.execute(
+            "SELECT COUNT(*) FROM event_hold_releases").fetchone()[0]
     check("one processed audit per stored event", ops.get("event_processed") == n_events)
     check("ten corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5, op6 re-pair)",
           ops.get("event_corrected") == 10)
@@ -2039,6 +2339,10 @@ def run(client):
           ops.get("dispute_resolved") == n_resolved)
     check("one audit per clearing batch (initial and adjustments)",
           ops.get("clearing_closed") == n_clearing == 5)
+    check("one audit per created event hold",
+          ops.get("event_held") == n_holds)
+    check("one audit per appended hold release",
+          ops.get("event_hold_released") == n_hold_releases)
 
     entries = audit["entries"]
     check("genesis record has empty prev_hash", entries[0]["prev_hash"] == "")
@@ -2084,9 +2388,21 @@ def run(client):
     client.post("/clearings", json=dict(                                     # 422 inverted window
         clearing_body, clearing_id="clr-no-audit",
         window_start="2026-10-11T00:00:00Z", window_end="2026-10-10T00:00:00Z"))
+    client.post("/event-holds", json=hold_body)                              # duplicate hold
+    client.post("/event-holds", json=dict(hold_body, reason="other"))        # 409 hold
+    client.post("/event-holds/hold-2026-12-15-a/release",
+                json={"expected_version": 1})                                # duplicate release
+    client.post("/event-holds/hold-2026-12-15-a/release",
+                json={"expected_version": 2})                                # 409 re-release
+    client.post("/event-holds", json={                                       # 404 unknown event
+        "hold_id": "hold-no-audit", "passenger_id": "HF",
+        "event_ids": ["nope"], "reason": "x"})
     client.post("/events", json={"event_id": "x9", "passenger_id": "X",
                                  "station_id": "NOPE", "tap_type": "in",
                                  "occurred_at": "2026-09-21T08:00:00Z"})  # 422
+    client.post("/events", json={"event_id": "hf1", "passenger_id": "HF",
+                                 "station_id": "S01", "tap_type": "in",
+                                 "occurred_at": "2026-12-15T08:00:00Z"})  # no longer held: dup, no audit
     check("repeated/failed requests create no new audit records",
           client.get("/audit", params={"limit": 1000}).json()["count"] == audit["count"])
 
@@ -2151,8 +2467,10 @@ def run(client):
     append_audit(tmp, "dispute_opened", {"i": 6}, {"ok": True})
     append_audit(tmp, "dispute_resolved", {"i": 7}, {"ok": True})
     append_audit(tmp, "clearing_closed", {"i": 8}, {"ok": True})
+    append_audit(tmp, "event_held", {"i": 9}, {"ok": True})
+    append_audit(tmp, "event_hold_released", {"i": 10}, {"ok": True})
     rep = verify_chain(tmp)
-    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 8)
+    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 10)
     tmp.execute(
         "INSERT INTO network_validations (validation_id, payload_hash, payload,"
         " effective_start, effective_end, passed, result, created_at)"
@@ -2177,6 +2495,19 @@ def run(client):
         " amount_cents, payload_hash, review_note, created_at)"
         " VALUES ('RF-d1','d1','P','t1',100,'h',NULL,'now')"
     )
+    tmp.execute(
+        "INSERT INTO event_holds (hold_id, payload_hash, passenger_id, event_ids,"
+        " reason, freeze_adjustments, created_at)"
+        " VALUES ('h1','h','P','[\"e1\"]','why','[]','now')"
+    )
+    tmp.execute(
+        "INSERT INTO event_hold_snapshots (hold_id, seq, event_id, prior_status, payload)"
+        " VALUES ('h1',0,'e1','paired','{}')"
+    )
+    tmp.execute(
+        "INSERT INTO event_hold_releases (hold_id, payload_hash, expected_version,"
+        " result, created_at) VALUES ('h1','h',1,'{}','now')"
+    )
     blocked = []
     for stmt in ("UPDATE audit_log SET operation = 'event_processed' WHERE seq = 1",
                  "DELETE FROM audit_log WHERE seq = 2",
@@ -2189,13 +2520,20 @@ def run(client):
                  "UPDATE dispute_snapshots SET amount_cents = 1 WHERE dispute_id = 'd1'",
                  "DELETE FROM dispute_snapshots WHERE dispute_id = 'd1'",
                  "UPDATE refunds SET amount_cents = 1 WHERE dispute_id = 'd1'",
-                 "DELETE FROM refunds WHERE dispute_id = 'd1'"):
+                 "DELETE FROM refunds WHERE dispute_id = 'd1'",
+                 "UPDATE event_holds SET reason = 'x' WHERE hold_id = 'h1'",
+                 "DELETE FROM event_holds WHERE hold_id = 'h1'",
+                 "UPDATE event_hold_snapshots SET prior_status = 'pending'"
+                 " WHERE hold_id = 'h1'",
+                 "DELETE FROM event_hold_snapshots WHERE hold_id = 'h1'",
+                 "UPDATE event_hold_releases SET expected_version = 2 WHERE hold_id = 'h1'",
+                 "DELETE FROM event_hold_releases WHERE hold_id = 'h1'"):
         try:
             tmp.execute(stmt)
         except sqlite3.Error:
             blocked.append(stmt)
-    check("audit, network and dispute rows cannot be updated or deleted",
-          len(blocked) == 12)
+    check("audit, network, dispute and hold rows cannot be updated or deleted",
+          len(blocked) == 18)
 
     tmp.execute("DROP TRIGGER trg_audit_no_update")
     tmp.execute("UPDATE audit_log SET result_summary = '{\"tampered\":true}' WHERE seq = 2")

@@ -149,6 +149,11 @@ def load_window_events(
 
     grouped: dict[str, list[Event]] = {}
     for r in conn.execute(sql, params).fetchall():
+        if r["status"] == "held":
+            # Events frozen by a review hold are withdrawn from operational
+            # use; a quality scan skips them (and the adjacent-event rule is
+            # evaluated as though the frozen taps were absent).
+            continue
         occurred = normalize_ts(
             datetime.fromisoformat(r["occurred_at"].replace("Z", "+00:00"))
         )

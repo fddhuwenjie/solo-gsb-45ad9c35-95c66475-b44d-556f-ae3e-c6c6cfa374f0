@@ -193,6 +193,9 @@ def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
         "SELECT * FROM events WHERE passenger_id = ? ORDER BY occurred_at, seq",
         (passenger_id,),
     ).fetchall()
+    # Events frozen by a review hold are withdrawn from settlement: they do
+    # not pair, do not bill and never appear in the pending list until the hold
+    # is released (their rows keep status='held').
     events = [
         Event(
             event_id=r["event_id"],
@@ -203,6 +206,7 @@ def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
             seq=r["seq"],
         )
         for r in rows
+        if r["status"] != "held"
     ]
 
     trips, pending = pair_trips(events)
