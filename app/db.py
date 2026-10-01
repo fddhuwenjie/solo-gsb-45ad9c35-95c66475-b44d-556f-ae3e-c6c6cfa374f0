@@ -15,9 +15,18 @@ CREATE TABLE IF NOT EXISTS events (
     occurred_at    TEXT NOT NULL,          -- ISO-8601, normalised to UTC
     seq            INTEGER NOT NULL,       -- arrival order, tie-breaks equal timestamps
     status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('paired', 'pending')),
-    pending_reason TEXT
+    pending_reason TEXT,
+    -- Non-null while the event's complete payload is frozen under a tap-event
+    -- review hold. Held events are excluded from pairing, billing and the
+    -- pending list until the (immutable) hold is released; the event row itself
+    -- is never rewritten by a hold (no FK: the marker is set before the hold
+    -- row exists, and hold rows can never be deleted anyway).
+    held_id        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_passenger ON events (passenger_id, occurred_at, seq);
+-- idx_events_held is created in Database.__init__ (after the additive
+-- migration for databases that predate held_id), so SCHEMA can run unchanged
+-- on both fresh and older files.
 
 CREATE TABLE IF NOT EXISTS trips (
     trip_id       TEXT PRIMARY KEY,        -- "<in_event_id>:<out_event_id>"
@@ -46,6 +55,88 @@ CREATE TABLE IF NOT EXISTS trip_charges (
     basis                    TEXT NOT NULL       -- JSON: full billing basis
 );
 CREATE INDEX IF NOT EXISTS idx_charges_passenger ON trip_charges (passenger_id, day_key);
+
+-- Tap-event review holds (刷卡事件复核暂存). A hold freezes the complete payload
+-- of one or more of a passenger's events while a review runs. Each held event
+-- gets an immutable payload snapshot row; the events' held_id marker removes
+-- them from pairing, billing and the pending list. The hold row and its
+-- snapshots are append-only: only the events.held_id marker is cleared on
+-- release. Whether a hold is still held or already released is derived from
+-- the existence of an immutable release row (version 1 = held, 2 = released).
+CREATE TABLE IF NOT EXISTS event_holds (
+    hold_id            TEXT PRIMARY KEY,
+    payload_hash       TEXT NOT NULL,     -- sha256 of the canonical hold request
+    payload            TEXT NOT NULL,     -- canonical JSON of the normalised request
+    passenger_id       TEXT NOT NULL,
+    review_reason      TEXT NOT NULL,
+    event_count        INTEGER NOT NULL,
+    result             TEXT NOT NULL,     -- JSON: the hold response body
+    created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_hold_snapshots (
+    hold_id            TEXT NOT NULL REFERENCES event_holds(hold_id),
+    seq                INTEGER NOT NULL,  -- 0-based, event_ids in canonical (sorted) order
+    event_id           TEXT NOT NULL,
+    passenger_id       TEXT NOT NULL,
+    station_id         TEXT NOT NULL,
+    tap_type           TEXT NOT NULL,
+    occurred_at        TEXT NOT NULL,     -- ISO-8601, normalised to UTC
+    event_seq          INTEGER NOT NULL,  -- the event's original arrival seq, preserved on release
+    payload_hash       TEXT NOT NULL,     -- sha256 of this event's canonical payload
+    frozen_at          TEXT NOT NULL,
+    PRIMARY KEY (hold_id, seq)
+);
+
+-- Release outcomes are append-only: a hold is released at most once. The
+-- expected version and the frozen per-event payload hashes gate the release;
+-- a version conflict or snapshot divergence refuses and leaves events held.
+-- The post-release settlement deltas are frozen onto the release row itself;
+-- nothing ever rewrites a hold or a snapshot.
+CREATE TABLE IF NOT EXISTS event_hold_releases (
+    release_id            TEXT PRIMARY KEY,   -- "RL-<hold_id>"
+    hold_id               TEXT NOT NULL UNIQUE REFERENCES event_holds(hold_id),
+    payload_hash          TEXT NOT NULL,       -- sha256 of the canonical release request
+    expected_version      INTEGER NOT NULL,    -- optimistic version the release was based on
+    result                TEXT NOT NULL,       -- JSON: the release response body (frozen deltas)
+    created_at            TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_event_holds_no_update
+BEFORE UPDATE ON event_holds
+BEGIN
+    SELECT RAISE(ABORT, 'event_holds is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_holds_no_delete
+BEFORE DELETE ON event_holds
+BEGIN
+    SELECT RAISE(ABORT, 'event_holds is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_snapshots_no_update
+BEFORE UPDATE ON event_hold_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_snapshots are immutable: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_snapshots_no_delete
+BEFORE DELETE ON event_hold_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_snapshots are immutable: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_releases_no_update
+BEFORE UPDATE ON event_hold_releases
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_releases is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_hold_releases_no_delete
+BEFORE DELETE ON event_hold_releases
+BEGIN
+    SELECT RAISE(ABORT, 'event_hold_releases is append-only: DELETE is not allowed');
+END;
 
 CREATE TABLE IF NOT EXISTS recon_batches (
     batch_id              TEXT PRIMARY KEY,
@@ -425,7 +516,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed')),
+                          'clearing_closed',
+                          'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
     result_summary   TEXT NOT NULL,         -- canonical JSON of the normalised result
@@ -454,6 +546,7 @@ _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
+    "event_held", "event_hold_released",
 )
 
 _AUDIT_UPGRADE = """
@@ -467,7 +560,8 @@ CREATE TABLE audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed')),
+                          'clearing_closed',
+                          'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
     result_summary   TEXT NOT NULL,
@@ -511,6 +605,22 @@ class Database:
             ).fetchone()[0]
             if any(op not in sql for op in _AUDIT_OPERATIONS):
                 self._conn.executescript(_AUDIT_UPGRADE)
+            # Upgrade an older database whose events table predates the
+            # tap-event review hold marker (the events table has no append-only
+            # triggers, so a plain additive ALTER is enough).
+            event_cols = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(events)")
+            }
+            if "held_id" not in event_cols:
+                self._conn.execute(
+                    "ALTER TABLE events ADD COLUMN held_id TEXT"
+                )
+            # Unconditional: a fresh DB gets it here too (the CREATE TABLE
+            # above cannot include this index, since SCHEMA must also run on
+            # pre-hold databases before the additive ALTER above).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_held ON events (held_id)"
+            )
 
     def lock(self) -> threading.RLock:
         return self._lock

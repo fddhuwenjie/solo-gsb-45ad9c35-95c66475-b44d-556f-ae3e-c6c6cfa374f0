@@ -1,6 +1,6 @@
 # 公共交通票价结算 API
 
-基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供运营方票款清分接口 `POST /clearings`：首次关账按出站时间冻结 UTC 半开结算区间与按起终点站配置的运营方万分比（10000=100%）规则，区间内行程缺匹配规则或份额合计不为 10000 时整批拒绝；每笔实收按规则拆分，除不尽的分依次按小数余数降序、运营方 ID 升序分配，并写入带触发器保护的不可变流水。刷卡更正导致行程金额、站点或配对变化后，已关账流水绝不改写；后续批次用新的 `clearing_id` 经 `POST /clearings/adjustments` 引用首次关账，沿用冻结区间与规则，按当前应分金额减去历次累计只追加正负差额（行程消失全额冲回、站点对变化时旧运营方冲回新运营方补入），重复调整不会重复入账。同 `clearing_id` 同载荷幂等、异载荷返回 `409`，可用 `GET /clearings/{id}` 查询冻结结果。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。
+基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供运营方票款清分接口 `POST /clearings`：首次关账按出站时间冻结 UTC 半开结算区间与按起终点站配置的运营方万分比（10000=100%）规则，区间内行程缺匹配规则或份额合计不为 10000 时整批拒绝；每笔实收按规则拆分，除不尽的分依次按小数余数降序、运营方 ID 升序分配，并写入带触发器保护的不可变流水。刷卡更正导致行程金额、站点或配对变化后，已关账流水绝不改写；后续批次用新的 `clearing_id` 经 `POST /clearings/adjustments` 引用首次关账，沿用冻结区间与规则，按当前应分金额减去历次累计只追加正负差额（行程消失全额冲回、站点对变化时旧运营方冲回新运营方补入），重复调整不会重复入账。同 `clearing_id` 同载荷幂等、异载荷返回 `409`，可用 `GET /clearings/{id}` 查询冻结结果。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。最后提供刷卡事件**复核暂存与释放**：`POST /events/review-holds` 提交 `hold_id`、乘客、事件 ID 列表与复核原因，服务在一个事务内确认事件归属并冻结每条事件的完整载荷快照、将其标记为 `held`（暂不参与配对、计费与待处理查询）；任一事件已被对账批次、清分批次或已结案争议引用则整批 `409` 且不改变状态。同 `hold_id` 同载荷幂等、异载荷 `409`；暂存期间用相同 `event_id` 提交更正一律拒绝。`POST /events/review-holds/{hold_id}/release` 凭期望版本释放，按原 `seq` 与事件时间重新结算并返回受影响行程的增减额；版本冲突或事件快照不一致时拒绝释放并保持 `held`。暂存记录与事件快照不可修改，释放结果另行只追加，`GET /events/review-holds/{hold_id}` 查询冻结状态。
 
 ## 启动
 
@@ -32,6 +32,14 @@ SQLite 数据文件持久化在 `transit-data` 卷中（容器内路径 `/data/t
   - `event_id` 相同但内容不同 → 视为更正（`corrected`），更新记录并触发重算；
   - 任何新记录（包括迟到记录）都会触发该乘客全量确定性重算，响应中的 `adjustments` 列出每段行程的 `old/new/delta` 金额与完整计费依据 `basis`；配对关系变化导致行程消失时会返回金额为负的冲正调账。
 - **金额单位**：所有金额均为整数分（cents），货币见配置 `currency`。
+- **刷卡事件复核暂存与释放**：
+  - **暂存**（`POST /events/review-holds`）：同一事务内确认每个 `event_id` 存在且属于该乘客，并为每条事件冻结**完整载荷快照**（乘客、站点、刷卡类型、UTC 事件时间、原始到达 `seq` 与逐事件载荷哈希），随后把事件标记为 `held` 并立即对该乘客重算——暂存事件**不参与**配对、计费，也不出现在 `GET /pending` 中（其余事件照常结算）；响应给出因抽出暂存事件而产生的各行程正负调账。
+  - **整批拒绝**：任一事件已被**对账批次**（`recon_results`）、**清分批次**（`clearing_entries`）或**已结案争议**（`refunds`，按行程 `trip_id` 的进站/出站事件匹配）引用，或已处于另一暂存中，整批返回 `409`，**不写入任何暂存或快照、不改变状态**。仅 open 的争议不算 booked，引用其行程不阻止暂存。事件不存在或属于其他乘客返回 `422`，事件 ID 列表为空或含重复也返回 `422`。
+  - **幂等与冲突**：相同 `hold_id` + 相同载荷（`event_ids` 数组顺序不影响判定）重复提交返回已存冻结结果（`status="duplicate"`）；相同 `hold_id` + 不同载荷返回 `409`。暂存期间对暂存事件以相同 `event_id` 提交**不同载荷的更正一律 `409` 拒绝**（载荷完全相同的重复提交仍是幂等 `duplicate`）。
+  - **乐观版本**：暂存为 `state="held"`、`version=1`；`POST /events/review-holds/{hold_id}/release` 必须提交 `expected_version=1`，版本不符返回 `409` 且事件保持 held。
+  - **快照一致性**：释放前逐条比对冻结的逐事件载荷哈希；任何事件当前载荷与快照不一致（或已不在该暂存下）都拒绝释放（`409`）并保持 held——复核始终以冻结快照为准。
+  - **释放重算**：校验通过后清除 held 标记，事件按**原始 `seq` 与事件时间**重新进入配对与计费，响应在 `release.adjustments` 中给出受影响行程的增减额；释放结果（含调账）**另行追加**到只追加表，`state="released"`、`version=2`。
+  - **不可修改**：`event_holds`、`event_hold_snapshots` 与 `event_hold_releases` 均带禁止 `UPDATE`/`DELETE` 的触发器；一个暂存至多释放一次，相同释放请求幂等返回 `duplicate`，其它释放载荷 `409`。
 - **运营方票款清分**：
   - **首次关账**（`POST /clearings`）：冻结按**出站时间**（`ended_at`）界定的 UTC 半开区间 `[window_start, window_end)` 与按有向起讫站对配置的运营方万分比规则；同一站对不得重复配置、同规则内运营方不得重复、每条规则份额合计必须恰为 **10000**，且区间内**每笔**行程都必须能匹配到规则，否则**整批拒绝**（不写任何批次或流水）。
   - **尾分分配**：每个运营方先取 `floor(金额 × 万分比 / 10000)`，剩余整数分按**小数余数降序**逐分发放，余数相同按**运营方 ID 升序**兜底；拆分结果合计严格等于行程金额（封顶导致 0 元行程各运营方均为 0）。
@@ -85,7 +93,108 @@ SQLite 数据文件持久化在 `transit-data` 卷中（容器内路径 `/data/t
 
 ### `GET /pending` — 待处理记录
 
-可选查询参数：`passenger_id`。返回所有无法配对的事件及原因。
+可选查询参数：`passenger_id`。返回所有无法配对的事件及原因。处于复核暂存（`held`）中的事件不会出现在结果中。
+
+### `POST /events/review-holds` — 刷卡事件复核暂存
+
+调用方提交暂存号 `hold_id`、乘客、要冻结的事件 ID 列表（至少一个）与复核原因。服务在**一个事务内**确认每条事件都存在且属于该乘客、未被任何已关账工件引用、尚未被其它暂存单占用，然后为每条事件冻结一份不可修改的完整载荷快照，把事件标记为 `held`，并立即对该乘客重算：被冻结事件暂时退出配对、计费与待处理查询。
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/events/review-holds \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hold_id": "hold-2026-10-22-a",
+    "passenger_id": "p-1001",
+    "event_ids": ["evt-003", "evt-004"],
+    "review_reason": "中段行程分区计费复核"
+  }'
+```
+
+- `event_ids` 顺序不影响载荷判定（服务按字典序规范化、去重），但同一请求内出现重复 ID 返回 `422`。
+- 任一 `event_id` 不存在或不属于 `passenger_id` 返回 `422`；任一事件已被对账批次 / 清分批次 / 已结案争议（按行程 `trip_id = "<in>:<out>"` 的任一事件匹配）引用，或已处于另一暂存中，整批 `409`，**不写任何数据、不改变状态**。
+- 暂存成功返回 `state="held"`、乐观版本 `version=1`，`snapshots` 是按规范化顺序排列的完整事件载荷快照（含原始到达 `event_seq`、逐事件 `payload_hash` 与 `frozen_at`）；`adjustments` 列出抽出这些事件后受影响行程的增减额（被冻结行程表现为负向冲正）。
+
+响应示例（暂存一段 500 分行程，抽出后该行程冲回）：
+
+```json
+{
+  "hold_id": "hold-2026-10-22-a",
+  "status": "created",
+  "state": "held",
+  "version": 1,
+  "passenger_id": "p-1001",
+  "event_ids": ["evt-003", "evt-004"],
+  "review_reason": "中段行程分区计费复核",
+  "created_at": "2026-10-22T10:00:00Z",
+  "released_at": null,
+  "snapshots": [
+    {"seq": 0, "event_id": "evt-003", "passenger_id": "p-1001",
+     "station_id": "S01", "tap_type": "in",
+     "occurred_at": "2026-10-22T12:00:00Z", "event_seq": 3,
+     "payload_hash": "ab12…", "frozen_at": "2026-10-22T10:00:00Z"},
+    {"seq": 1, "event_id": "evt-004", "passenger_id": "p-1001",
+     "station_id": "S04", "tap_type": "out",
+     "occurred_at": "2026-10-22T12:30:00Z", "event_seq": 4,
+     "payload_hash": "cd34…", "frozen_at": "2026-10-22T10:00:00Z"}
+  ],
+  "release": null,
+  "adjustments": [
+    {"trip_id": "evt-003:evt-004", "day_key": "2026-10-22",
+     "week_key": "2026-W43", "old_amount_cents": 500,
+     "new_amount_cents": 0, "delta_cents": -500,
+     "basis": {"voided": true, "reason": "trip no longer exists after re-pairing"}}
+  ],
+  "trip_change_count": 1
+}
+```
+
+**幂等与冲突**：相同 `hold_id` + 相同载荷重放返回同一冻结结果（`status="duplicate"`，`event_ids` 顺序不影响判定）；同号异载荷返回 `409`。暂存期间对被冻结事件提交同 `event_id` 不同载荷的更正返回 `409`（完全相同的重复提交仍是幂等 `duplicate`）。
+
+### `POST /events/review-holds/{hold_id}/release` — 复核完成后释放
+
+复核方提交其视图上的**期望版本**。服务校验暂存处于 held（`version=1`），并逐条重算事件载荷哈希与冻结快照比对；版本不符或任一快照不一致都返回 `409`、**保持 held**。校验通过后清除 held 标记，事件按原始到达 `seq` 与事件时间重新进入配对 / 计费，调账结果冻结到只追加的释放记录中。
+
+```bash
+curl -X POST http://localhost:8000/events/review-holds/hold-2026-10-22-a/release \
+  -H "Content-Type: application/json" \
+  -d '{"expected_version": 1}'
+```
+
+- 暂存不存在 → `404`；`expected_version != 1` → `409`（版本冲突，事件保持 held）。
+- 事件当前载荷与冻结快照不一致 → `409`，响应列出分歧事件，事件保持 held。
+- 成功后 `state="released"`、`version=2`，`release.release_id` 固定为 `"RL-<hold_id>"`，`release.adjustments` 给出释放重算后各受影响行程的增减额（上例中冲回的行程恢复为 `delta +500`）。
+- 释放记录只追加：相同释放请求幂等返回 `status="duplicate"`（同一 `release_id` / 调账 / 释放时间），任何不同释放载荷返回 `409`，不可二次释放。
+
+响应节选：
+
+```json
+{
+  "hold_id": "hold-2026-10-22-a",
+  "status": "created",
+  "state": "released",
+  "version": 2,
+  "released_at": "2026-10-22T11:00:00Z",
+  "release": {
+    "release_id": "RL-hold-2026-10-22-a",
+    "expected_version": 1,
+    "released_at": "2026-10-22T11:00:00Z",
+    "adjustments": [
+      {"trip_id": "evt-003:evt-004", "old_amount_cents": 0,
+       "new_amount_cents": 500, "delta_cents": 500, "basis": {"...": "..."}}
+    ]
+  }
+}
+```
+
+### `GET /events/review-holds/{hold_id}` — 查询暂存冻结状态
+
+返回暂存号对应的冻结记录：规范化后的 `event_ids` 与逐事件快照、复核原因、`state`（`held` / `released`）、乐观版本 `version`，以及（释放后）另行追加的不可变释放结果 `release`（含调账）。`GET` 中 `status` 固定为 `"created"`（重放标记只出现在 `POST` 响应里）；暂存与快照在任何时候都按冻结原文返回。不存在返回 `404`。
+
+```bash
+curl http://localhost:8000/events/review-holds/hold-2026-10-22-a
+```
 
 ### `POST /reconciliations` — 扣款对账批次
 
@@ -827,7 +936,8 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 - 网络校验首次提交成功（无论是否通过）→ `network_validated`；网络快照固化成功 → `network_snapshot_created`；
 - 争议创建成功（冻结收费快照）→ `dispute_opened`；争议结案成功（写入不可变退款流水）→ `dispute_resolved`；
 - 运营方清分首次关账或追补批次创建成功（批次 + 不可变流水同事务提交）→ `clearing_closed`；
-- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、清分首账 / 追补幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
+- 刷卡事件复核暂存创建成功（暂存 + 逐事件快照 + 事件标记 held + 重算同事务提交）→ `event_held`；暂存释放成功（释放结果只追加 + 事件解除 held + 重算同事务提交）→ `event_hold_released`；
+- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、清分首账 / 追补幂等重复（`duplicate`）、暂存 / 释放幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
 - **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表，`POST /disruption/replans` 只写其独立的只追加重排表；三者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
 - 审计与业务数据同事务提交：业务写入（或审计写入）失败时一并回滚，不留半截记录。
 
@@ -837,7 +947,7 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 
 可选查询参数：
 
-- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved` / `clearing_closed`）；
+- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved` / `clearing_closed` / `event_held` / `event_hold_released`）；
 - `after`：只返回 `seq > after` 的记录（分页游标，默认 0）；
 - `limit`：每页条数（默认 100，最大 1000）。
 

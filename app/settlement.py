@@ -188,9 +188,14 @@ def charge_row(trip: Trip) -> tuple:
 
 def settle_passenger(conn, cfg: FareConfig, passenger_id: str) -> list[dict]:
     """Recompute a passenger's full settlement, persist it, and return the
-    list of adjustments (per-trip old/new amounts and billing basis)."""
+    list of adjustments (per-trip old/new amounts and billing basis).
+
+    Events frozen under a review hold (``held_id IS NOT NULL``) are excluded:
+    while held they take no part in pairing or billing, and their stored
+    pairing status is left untouched until the hold is released."""
     rows = conn.execute(
-        "SELECT * FROM events WHERE passenger_id = ? ORDER BY occurred_at, seq",
+        "SELECT * FROM events WHERE passenger_id = ? AND held_id IS NULL"
+        " ORDER BY occurred_at, seq",
         (passenger_id,),
     ).fetchall()
     events = [

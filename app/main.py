@@ -35,6 +35,16 @@ from .disputes import (
     payload_hash,
     refund_id_for,
 )
+from .event_holds import (
+    build_hold_view,
+    canonical_hold_payload,
+    canonical_release_payload,
+    event_payload_hash,
+    hold_response,
+    payload_hash as hold_payload_hash,
+    referenced_event_ids,
+    release_id_for,
+)
 from .disruption import (
     build_replan,
     canonical_replan_payload,
@@ -63,6 +73,9 @@ from .models import (
     DisputeResolveIn,
     DisruptionReplanIn,
     DisruptionReplanOut,
+    EventHoldIn,
+    EventHoldOut,
+    EventHoldReleaseIn,
     EventQualityScanIn,
     EventQualityScanOut,
     EventResult,
@@ -131,7 +144,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -195,6 +208,19 @@ def submit_event(
                     event_pairing=existing["status"],
                     pending_reason=existing["pending_reason"],
                     adjustments=[],
+                )
+            # A different payload is a correction -- unless the event's
+            # complete payload is frozen under an open review hold. Held
+            # events can never be corrected; the review must finish (release
+            # or a new event id) first.
+            if existing["held_id"] is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"event_id '{body.event_id}' is held under review hold"
+                        f" '{existing['held_id']}'; corrections are refused until"
+                        " that hold is released"
+                    ),
                 )
             # Correction: same event id, different payload -> update and re-settle.
             db.conn.execute(
@@ -322,7 +348,7 @@ def pending_events(
     passenger_id: str | None = Query(default=None),
     db: Database = Depends(get_db),
 ) -> list[PendingEvent]:
-    sql = "SELECT * FROM events WHERE status = 'pending'"
+    sql = "SELECT * FROM events WHERE status = 'pending' AND held_id IS NULL"
     params: list = []
     if passenger_id:
         sql += " AND passenger_id = ?"
@@ -341,6 +367,315 @@ def pending_events(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tap-event review holds (刷卡事件复核暂存与释放)
+# ---------------------------------------------------------------------------
+
+
+def _load_hold(db: Database, hold_id: str, status: str) -> EventHoldOut:
+    hold = db.conn.execute(
+        "SELECT * FROM event_holds WHERE hold_id = ?", (hold_id,)
+    ).fetchone()
+    if hold is None:
+        raise HTTPException(
+            status_code=404, detail=f"event review hold '{hold_id}' not found"
+        )
+    return hold_response(db.conn, hold, status)
+
+
+@app.post("/events/review-holds", response_model=EventHoldOut, status_code=200)
+def create_event_hold(
+    body: EventHoldIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    """Freeze one or more of a passenger's events for review. One transaction
+    verifies ownership, blocks holds over events already booked by a
+    reconciliation/clearing/resolved dispute, snapshots every complete event
+    payload, marks the events held and re-settles the passenger without them."""
+    if len(set(body.event_ids)) != len(body.event_ids):
+        raise HTTPException(status_code=422, detail="duplicate event_id in event_ids")
+
+    canonical_payload = canonical_hold_payload(body)
+    p_hash = hold_payload_hash(canonical_payload)
+    event_ids = canonical_payload["event_ids"]
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT payload_hash FROM event_holds WHERE hold_id = ?",
+            (body.hold_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"hold_id '{body.hold_id}' already exists with a different payload",
+                )
+            # Idempotent replay: the frozen hold/snapshots are never recomputed.
+            return _load_hold(db, body.hold_id, "duplicate")
+
+        rows = db.conn.execute(
+            "SELECT * FROM events WHERE event_id IN ({})".format(
+                ",".join("?" for _ in event_ids)
+            ),
+            event_ids,
+        ).fetchall()
+        by_id = {r["event_id"]: r for r in rows}
+        missing = sorted(set(event_ids) - set(by_id))
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"event_id(s) not found: {missing}",
+            )
+        foreign = sorted(
+            eid for eid, r in by_id.items()
+            if r["passenger_id"] != body.passenger_id
+        )
+        if foreign:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"event_id(s) {foreign} do not belong to passenger"
+                    f" '{body.passenger_id}'"
+                ),
+            )
+        already_held = sorted(
+            eid for eid, r in by_id.items() if r["held_id"] is not None
+        )
+        if already_held:
+            holders = sorted({by_id[e]["held_id"] for e in already_held})
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event_id(s) {already_held} are already held under"
+                    f" review hold(s) {holders}"
+                ),
+            )
+        referenced = referenced_event_ids(db.conn, event_ids)
+        if referenced:
+            # Whole-batch refusal: no marker or snapshot row is written.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event_id(s) {referenced} are already referenced by a"
+                    " reconciliation batch, a clearing batch or a resolved"
+                    " dispute and cannot be held"
+                ),
+            )
+
+        frozen_at = iso_str(datetime.now(timezone.utc))
+        # Mark the events held first; settle_passenger then sees none of them,
+        # so pairing and billing stop using the whole frozen set atomically.
+        db.conn.executemany(
+            "UPDATE events SET held_id = ? WHERE event_id = ?",
+            [(body.hold_id, eid) for eid in event_ids],
+        )
+        adjustments = settle_passenger(db.conn, cfg, body.passenger_id)
+
+        snapshot_specs = [
+            {
+                "seq": seq,
+                "event_id": r["event_id"],
+                "passenger_id": r["passenger_id"],
+                "station_id": r["station_id"],
+                "tap_type": r["tap_type"],
+                "occurred_at": r["occurred_at"],
+                "event_seq": r["seq"],
+                "payload_hash": event_payload_hash(r),
+                "frozen_at": frozen_at,
+            }
+            for seq, r in enumerate((by_id[e] for e in event_ids))
+        ]
+        # Build the frozen response before inserting the hold row, so the
+        # immutable row stores the complete hold-time result in one INSERT.
+        response = build_hold_view(
+            hold_id=body.hold_id,
+            passenger_id=body.passenger_id,
+            review_reason=body.review_reason,
+            event_ids=event_ids,
+            created_at=frozen_at,
+            snapshot_rows=snapshot_specs,
+            hold_adjustments=[Adjustment(**a) for a in adjustments],
+        )
+        db.conn.execute(
+            "INSERT INTO event_holds (hold_id, payload_hash, payload,"
+            " passenger_id, review_reason, event_count, result, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                body.hold_id,
+                p_hash,
+                canonical_json(canonical_payload),
+                body.passenger_id,
+                body.review_reason,
+                len(event_ids),
+                canonical_json(response.model_dump()),
+                frozen_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO event_hold_snapshots (hold_id, seq, event_id,"
+            " passenger_id, station_id, tap_type, occurred_at, event_seq,"
+            " payload_hash, frozen_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    body.hold_id,
+                    s["seq"],
+                    s["event_id"],
+                    s["passenger_id"],
+                    s["station_id"],
+                    s["tap_type"],
+                    s["occurred_at"],
+                    s["event_seq"],
+                    s["payload_hash"],
+                    s["frozen_at"],
+                )
+                for s in snapshot_specs
+            ],
+        )
+        append_audit(
+            db.conn,
+            "event_held",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.post(
+    "/events/review-holds/{hold_id}/release",
+    response_model=EventHoldOut,
+    status_code=200,
+)
+def release_event_hold(
+    hold_id: str,
+    body: EventHoldReleaseIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    """Release a review hold after the expected optimistic version. The frozen
+    per-event payload hashes must still match the live rows; on a mismatch (or
+    a version conflict) the release aborts and every event stays held. On
+    success the events return to settlement in their original (occurred_at,
+    seq) order and the signed trip deltas are appended as an immutable release
+    result."""
+    canonical_payload = canonical_release_payload(body, hold_id)
+    p_hash = hold_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        hold = db.conn.execute(
+            "SELECT * FROM event_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if hold is None:
+            raise HTTPException(
+                status_code=404, detail=f"event review hold '{hold_id}' not found"
+            )
+
+        existing_release = db.conn.execute(
+            "SELECT * FROM event_hold_releases WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if existing_release is not None:
+            if existing_release["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"hold '{hold_id}' is already released (version 2); the"
+                        " immutable release result cannot be re-released"
+                    ),
+                )
+            # Idempotent replay of the identical release.
+            return _load_hold(db, hold_id, "duplicate")
+
+        if body.expected_version != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"version conflict: hold '{hold_id}' is at version 1"
+                    f" (held); expected_version {body.expected_version} is stale"
+                ),
+            )
+
+        snapshots = db.conn.execute(
+            "SELECT * FROM event_hold_snapshots WHERE hold_id = ? ORDER BY seq",
+            (hold_id,),
+        ).fetchall()
+        live_rows = {
+            r["event_id"]: r
+            for r in db.conn.execute(
+                "SELECT * FROM events WHERE event_id IN ({})".format(
+                    ",".join("?" for _ in snapshots)
+                ),
+                [s["event_id"] for s in snapshots],
+            )
+        }
+        diverged: list[str] = []
+        for snap in snapshots:
+            live = live_rows.get(snap["event_id"])
+            if (
+                live is None
+                or live["held_id"] != hold_id
+                or event_payload_hash(live) != snap["payload_hash"]
+            ):
+                diverged.append(snap["event_id"])
+        if diverged:
+            # Snapshot divergence refuses the release and leaves the hold in
+            # place: the frozen payloads are the review's source of truth.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"event snapshot mismatch for event_id(s) {sorted(diverged)};"
+                    " release refused and the events remain held"
+                ),
+            )
+
+        released_at = iso_str(datetime.now(timezone.utc))
+        # Clear the hold markers and re-settle. The events' original arrival
+        # seq was never touched, so pairing resumes in the original
+        # (occurred_at, seq) order.
+        db.conn.executemany(
+            "UPDATE events SET held_id = NULL WHERE event_id = ?",
+            [(snap["event_id"],) for snap in snapshots],
+        )
+        adjustments = settle_passenger(db.conn, cfg, hold["passenger_id"])
+
+        release_result = {
+            "release_id": release_id_for(hold_id),
+            "expected_version": body.expected_version,
+            "released_at": released_at,
+            "adjustments": [Adjustment(**a).model_dump() for a in adjustments],
+        }
+        db.conn.execute(
+            "INSERT INTO event_hold_releases (release_id, hold_id, payload_hash,"
+            " expected_version, result, created_at) VALUES (?,?,?,?,?,?)",
+            (
+                release_id_for(hold_id),
+                hold_id,
+                p_hash,
+                body.expected_version,
+                canonical_json(release_result),
+                released_at,
+            ),
+        )
+        response = _load_hold(db, hold_id, "created")
+        append_audit(
+            db.conn,
+            "event_hold_released",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.get("/events/review-holds/{hold_id}", response_model=EventHoldOut)
+def get_event_hold(
+    hold_id: str,
+    db: Database = Depends(get_db),
+) -> EventHoldOut:
+    with db.lock():
+        return _load_hold(db, hold_id, "created")
 
 
 def _recon_response(meta: dict, items: list[dict], status: str, currency: str) -> ReconBatchOut:
@@ -1850,7 +2185,8 @@ def list_audit(
         default=None,
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
-                "|dispute_opened|dispute_resolved|clearing_closed)$",
+                "|dispute_opened|dispute_resolved|clearing_closed"
+                "|event_held|event_hold_released)$",
         description="Filter by operation type",
     ),
     after: int = Query(default=0, ge=0, description="Return records with seq > after"),

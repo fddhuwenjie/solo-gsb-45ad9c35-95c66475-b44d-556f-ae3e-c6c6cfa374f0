@@ -133,6 +133,7 @@ AuditOperation = Literal[
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
+    "event_held", "event_hold_released",
 ]
 
 
@@ -600,3 +601,61 @@ class DisruptionReplanOut(BaseModel):
     min_transfer_seconds: int
     summary: ReplanSummary
     groups: list[ReplanGroupResult]
+
+
+# ---------------------------------------------------------------------------
+# Tap-event review holds (刷卡事件复核暂存与释放)
+# ---------------------------------------------------------------------------
+
+
+class EventHoldIn(BaseModel):
+    hold_id: str = Field(min_length=1, max_length=128)
+    passenger_id: str = Field(min_length=1, max_length=128)
+    event_ids: list[str] = Field(
+        min_length=1, description="Complete payloads of these events are frozen for review",
+    )
+    review_reason: str = Field(min_length=1, max_length=2000)
+
+
+class EventHoldReleaseIn(BaseModel):
+    expected_version: int = Field(
+        ge=1,
+        description="Optimistic hold version the release is based on (1 while held, 2 once released)",
+    )
+
+
+class HeldEventSnapshot(BaseModel):
+    seq: int                         # 0-based, canonical (sorted event id) order
+    event_id: str
+    passenger_id: str
+    station_id: str
+    tap_type: Literal["in", "out"]
+    occurred_at: str
+    event_seq: int                   # the event's original arrival seq, preserved on release
+    payload_hash: str                # sha256 of the canonical single-event payload
+    frozen_at: str
+
+
+class HoldReleaseResult(BaseModel):
+    release_id: str
+    expected_version: int
+    released_at: str
+    adjustments: list[Adjustment]    # signed per-trip deltas after re-settlement
+
+
+class EventHoldOut(BaseModel):
+    hold_id: str
+    status: Literal["created", "duplicate"]   # request replay marker
+    state: Literal["held", "released"]
+    version: int                    # 1 while held, 2 once released (optimistic)
+    passenger_id: str
+    event_ids: list[str]            # canonical (sorted, de-duplicated) order
+    review_reason: str
+    created_at: str
+    released_at: str | None
+    snapshots: list[HeldEventSnapshot]
+    release: HoldReleaseResult | None = None
+    # Settlement deltas produced when the events were removed from pairing and
+    # billing at hold time; present on the POST response (and frozen in storage).
+    adjustments: list[Adjustment] = []
+    trip_change_count: int = 0
